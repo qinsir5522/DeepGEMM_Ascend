@@ -1012,5 +1012,387 @@ def main():
     runner.run_benchmarks()
 
 
+class ResultAnalyzer:
+    """Result analyzer for benchmark data analysis."""
+    
+    def __init__(self, result_dir: str = "./results"):
+        self.result_dir = result_dir
+        self.logger = BenchmarkLogger("ResultAnalyzer")
+        self.storage = ResultStorage(result_dir)
+    
+    def analyze_shape_results(self, shape: List[int], rank_id: Optional[int] = None) -> Dict[str, Any]:
+        """Analyze results for a specific shape."""
+        if rank_id is not None:
+            result_path = self.storage.get_result_path(shape, rank_id)
+            results = self.storage.load_results(result_path)
+            return self._compute_shape_analysis(results, shape)
+        
+        all_results = []
+        rank = 0
+        while True:
+            result_path = self.storage.get_result_path(shape, rank)
+            if not os.path.exists(result_path):
+                break
+            results = self.storage.load_results(result_path)
+            all_results.extend(results)
+            rank += 1
+        
+        return self._compute_shape_analysis(all_results, shape)
+    
+    def _compute_shape_analysis(self, results: List[BenchmarkResult], shape: List[int]) -> Dict[str, Any]:
+        """Compute comprehensive analysis for results."""
+        if not results:
+            return {'shape': shape, 'status': 'no_results'}
+        
+        valid_results = [r for r in results if r.is_valid()]
+        invalid_results = [r for r in results if not r.is_valid()]
+        
+        analysis = {
+            'shape': shape,
+            'total_count': len(results),
+            'valid_count': len(valid_results),
+            'invalid_count': len(invalid_results),
+            'validation_rate': len(valid_results) / len(results) if results else 0
+        }
+        
+        if valid_results:
+            times = [r.time for r in valid_results if r.time != float('inf')]
+            tflops = [r.get_tflops() for r in valid_results]
+            
+            analysis.update({
+                'time_stats': {
+                    'min_us': min(times) if times else 0,
+                    'max_us': max(times) if times else 0,
+                    'avg_us': statistics.mean(times) if times else 0,
+                    'median_us': statistics.median(times) if times else 0,
+                    'std_us': statistics.stdev(times) if len(times) > 1 else 0
+                },
+                'performance_stats': {
+                    'min_tflops': min(tflops) if tflops else 0,
+                    'max_tflops': max(tflops) if tflops else 0,
+                    'avg_tflops': statistics.mean(tflops) if tflops else 0,
+                    'median_tflops': statistics.median(tflops) if tflops else 0
+                },
+                'best_result': self._find_best_result(valid_results)
+            })
+        
+        error_ratios = [r.diff for r in results]
+        analysis['error_stats'] = {
+            'min_error': min(error_ratios),
+            'max_error': max(error_ratios),
+            'avg_error': statistics.mean(error_ratios),
+            'results_with_errors': sum(1 for r in results if r.diff > error_tol)
+        }
+        
+        negative_count = sum(1 for r in results if r.negative)
+        analysis['negative_value_stats'] = {
+            'count': negative_count,
+            'percentage': (negative_count / len(results)) * 100 if results else 0
+        }
+        
+        return analysis
+    
+    def _find_best_result(self, results: List[BenchmarkResult]) -> Optional[Dict[str, Any]]:
+        """Find the best performing result configuration."""
+        if not results:
+            return None
+        
+        best = min(results, key=lambda r: r.time)
+        return {
+            'index': best.idx,
+            'time_us': best.time,
+            'tflops': best.get_tflops(),
+            'parameters': best.parameters
+        }
+    
+    def compare_shapes(self, shapes: List[List[int]]) -> Dict[str, Any]:
+        """Compare performance across multiple shapes."""
+        comparisons = []
+        
+        for shape in shapes:
+            analysis = self.analyze_shape_results(shape)
+            if 'performance_stats' in analysis:
+                comparisons.append({
+                    'shape': shape,
+                    'avg_tflops': analysis['performance_stats']['avg_tflops'],
+                    'best_tflops': analysis['performance_stats']['max_tflops'],
+                    'median_time_us': analysis['time_stats']['median_us'],
+                    'valid_rate': analysis['validation_rate']
+                })
+        
+        if not comparisons:
+            return {'status': 'no_valid_results'}
+        
+        sorted_by_perf = sorted(comparisons, key=lambda x: x['avg_tflops'], reverse=True)
+        
+        return {
+            'rankings': sorted_by_perf,
+            'best_shape': sorted_by_perf[0]['shape'] if sorted_by_perf else None,
+            'worst_shape': sorted_by_perf[-1]['shape'] if sorted_by_perf else None,
+            'avg_tflops_all': statistics.mean(c['avg_tflops'] for c in comparisons)
+        }
+    
+    def generate_summary_report(self, shapes: Optional[List[List[int]]] = None) -> str:
+        """Generate a text summary report of benchmark results."""
+        shapes = shapes or shape_group
+        report_lines = [
+            "=" * 80,
+            "GEMM BENCHMARK SUMMARY REPORT",
+            "=" * 80,
+            f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Total Shapes Analyzed: {len(shapes)}",
+            ""
+        ]
+        
+        total_valid = 0
+        total_invalid = 0
+        
+        for i, shape in enumerate(shapes):
+            analysis = self.analyze_shape_results(shape)
+            report_lines.append(f"\nShape {i+1}: [{shape[0]}, {shape[1]}, {shape[2]}]")
+            report_lines.append("-" * 60)
+            
+            if 'performance_stats' not in analysis:
+                report_lines.append("  Status: No valid results")
+                continue
+            
+            total_valid += analysis['valid_count']
+            total_invalid += analysis['invalid_count']
+            
+            report_lines.append(f"  Total Tests: {analysis['total_count']}")
+            report_lines.append(f"  Valid Results: {analysis['valid_count']} ({analysis['validation_rate']*100:.1f}%)")
+            report_lines.append(f"  Time (us): min={analysis['time_stats']['min_us']:.2f}, "
+                               f"avg={analysis['time_stats']['avg_us']:.2f}, "
+                               f"max={analysis['time_stats']['max_us']:.2f}")
+            report_lines.append(f"  TFLOPS: min={analysis['performance_stats']['min_tflops']:.2f}, "
+                               f"avg={analysis['performance_stats']['avg_tflops']:.2f}, "
+                               f"max={analysis['performance_stats']['max_tflops']:.2f}")
+            
+            if analysis.get('best_result'):
+                best = analysis['best_result']
+                report_lines.append(f"  Best Config: idx={best['index']}, time={best['time_us']:.2f}us")
+        
+        report_lines.extend([
+            "",
+            "=" * 80,
+            "OVERALL STATISTICS",
+            "=" * 80,
+            f"Total Valid Results: {total_valid}",
+            f"Total Invalid Results: {total_invalid}",
+            f"Overall Success Rate: {(total_valid / (total_valid + total_invalid) * 100):.1f}%",
+            "=" * 80
+        ])
+        
+        return "\n".join(report_lines)
+    
+    def export_results_to_csv(self, output_path: str, shapes: Optional[List[List[int]]] = None):
+        """Export all results to CSV format."""
+        shapes = shapes or shape_group
+        all_results = []
+        
+        for shape in shapes:
+            rank = 0
+            while True:
+                result_path = self.storage.get_result_path(shape, rank)
+                if not os.path.exists(result_path):
+                    break
+                results = self.storage.load_results(result_path)
+                all_results.extend(results)
+                rank += 1
+        
+        if not all_results:
+            self.logger.warning("No results to export")
+            return
+        
+        try:
+            with open(output_path, 'w', newline='', encoding='utf-8') as f:
+                headers = ['idx', 'M', 'N', 'K', 'time_us', 'tflops', 
+                          'error_ratio', 'negative', 'm_sections', 'n_sections',
+                          'm_sec_o_blocks', 'n_sec_o_blocks', 'k_o_iter_blocks', 'db_o_blocks']
+                f.write(','.join(headers) + '\n')
+                
+                for r in all_results:
+                    row = [
+                        str(r.idx), str(r.M), str(r.N), str(r.K),
+                        f"{r.time:.6f}", f"{r.get_tflops():.6f}",
+                        f"{r.diff:.8f}", str(r.negative),
+                        str(r.parameters.get('m_sections', 0)),
+                        str(r.parameters.get('n_sections', 0)),
+                        str(r.parameters.get('m_sec_o_blocks', 0)),
+                        str(r.parameters.get('n_sec_o_blocks', 0)),
+                        str(r.parameters.get('k_o_iter_blocks', 0)),
+                        str(r.parameters.get('db_o_blocks', 0))
+                    ]
+                    f.write(','.join(row) + '\n')
+            
+            self.logger.info(f"Exported {len(all_results)} results to {output_path}")
+        except IOError as e:
+            self.logger.error(f"Failed to export results: {e}")
+
+
+class ConfigurationOptimizer:
+    """Optimize benchmark configurations based on historical results."""
+    
+    def __init__(self, result_dir: str = "./results"):
+        self.result_dir = result_dir
+        self.logger = BenchmarkLogger("ConfigurationOptimizer")
+        self.storage = ResultStorage(result_dir)
+    
+    def find_optimal_configs(self, shape: List[int], top_k: int = 5) -> List[Dict[str, Any]]:
+        """Find top-k optimal configurations for a shape."""
+        all_results = []
+        rank = 0
+        
+        while True:
+            result_path = self.storage.get_result_path(shape, rank)
+            if not os.path.exists(result_path):
+                break
+            results = self.storage.load_results(result_path)
+            all_results.extend(results)
+            rank += 1
+        
+        valid_results = [r for r in all_results if r.is_valid()]
+        
+        if not valid_results:
+            self.logger.warning(f"No valid results found for shape {shape}")
+            return []
+        
+        sorted_results = sorted(valid_results, key=lambda r: r.time)[:top_k]
+        
+        return [
+            {
+                'rank': i + 1,
+                'index': r.idx,
+                'time_us': r.time,
+                'tflops': r.get_tflops(),
+                'parameters': r.parameters
+            }
+            for i, r in enumerate(sorted_results)
+        ]
+    
+    def analyze_parameter_impact(self, shape: List[int]) -> Dict[str, Dict[str, float]]:
+        """Analyze impact of each parameter on performance."""
+        all_results = []
+        rank = 0
+        
+        while True:
+            result_path = self.storage.get_result_path(shape, rank)
+            if not os.path.exists(result_path):
+                break
+            results = self.storage.load_results(result_path)
+            all_results.extend(results)
+            rank += 1
+        
+        valid_results = [r for r in all_results if r.is_valid()]
+        
+        if not valid_results:
+            return {}
+        
+        param_names = ['m_sections', 'n_sections', 'm_sec_o_blocks', 
+                      'n_sec_o_blocks', 'k_o_iter_blocks', 'db_o_blocks']
+        
+        impact_analysis = {}
+        
+        for param in param_names:
+            values = {}
+            for r in valid_results:
+                val = r.parameters.get(param, 0)
+                if val not in values:
+                    values[val] = []
+                values[val].append(r.time)
+            
+            avg_times = {v: statistics.mean(times) for v, times in values.items()}
+            
+            if avg_times:
+                impact_analysis[param] = {
+                    'values': sorted(avg_times.keys()),
+                    'avg_times': [avg_times[v] for v in sorted(avg_times.keys())],
+                    'best_value': min(avg_times.keys(), key=lambda k: avg_times[k]),
+                    'best_time': min(avg_times.values()),
+                    'value_count': len(avg_times)
+                }
+        
+        return impact_analysis
+    
+    def suggest_configs(self, shape: List[int], budget: int = 10) -> List[Dict[str, int]]:
+        """Suggest configurations to test within a budget."""
+        impact = self.analyze_parameter_impact(shape)
+        
+        if not impact:
+            return []
+        
+        suggested = []
+        param_names = ['m_sections', 'n_sections', 'm_sec_o_blocks', 
+                      'n_sec_o_blocks', 'k_o_iter_blocks', 'db_o_blocks']
+        
+        base_config = {p: impact[p]['best_value'] for p in param_names}
+        suggested.append(base_config)
+        
+        for i, param in enumerate(param_names):
+            if len(suggested) >= budget:
+                break
+            
+            alt_config = base_config.copy()
+            values = impact[param]['values']
+            
+            if len(values) > 1:
+                best_idx = values.index(impact[param]['best_value'])
+                if best_idx > 0:
+                    alt_config[param] = values[best_idx - 1]
+                elif best_idx < len(values) - 1:
+                    alt_config[param] = values[best_idx + 1]
+                
+                if alt_config not in suggested:
+                    suggested.append(alt_config)
+        
+        return suggested[:budget]
+
+
+def cleanup_temp_files(directories: List[str] = None):
+    """Clean up temporary files and directories."""
+    directories = directories or ['./input', './output', './msp']
+    logger = BenchmarkLogger("CleanupUtility")
+    
+    for directory in directories:
+        if os.path.exists(directory):
+            try:
+                import shutil
+                shutil.rmtree(directory)
+                logger.info(f"Cleaned up directory: {directory}")
+            except Exception as e:
+                logger.warning(f"Failed to clean {directory}: {e}")
+
+
+def validate_environment() -> bool:
+    """Validate the execution environment for benchmarking."""
+    logger = BenchmarkLogger("EnvironmentValidator")
+    
+    checks = []
+    checks.append(("Python version", sys.version_info >= (3, 7)))
+    
+    try:
+        import torch
+        checks.append(("PyTorch available", True))
+        checks.append(("NPU available", torch.npu.is_available()))
+    except ImportError:
+        checks.append(("PyTorch available", False))
+        checks.append(("NPU available", False))
+    
+    try:
+        import deep_gemm_ascend
+        checks.append(("DeepGEMM Ascend available", True))
+    except ImportError:
+        checks.append(("DeepGEMM Ascend available", False))
+    
+    all_passed = all(check[1] for check in checks)
+    
+    logger.info("Environment Validation Results:")
+    for name, passed in checks:
+        status = "PASS" if passed else "FAIL"
+        logger.info(f"  {name}: {status}")
+    
+    return all_passed
+
+
 if __name__ == "__main__":
     main()
